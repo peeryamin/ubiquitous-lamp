@@ -1,76 +1,145 @@
-import { open } from 'sqlite';
-import sqlite3 from 'sqlite3';
+import pg from 'pg';
+const { Pool } = pg;
 import fs from 'fs';
 import path from 'path';
 import url from 'url';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-const DB_PATH = process.env.DB_PATH || (process.env.VERCEL ? '/tmp/parlor.db' : path.join(__dirname, 'parlor.db'));
 const SCHEMA_PATH = path.join(__dirname, 'schema.sql');
-const USE_TURSO = Boolean(process.env.TURSO_DATABASE_URL);
 
 const BLACK_RACKS_TABLES = [
   { id: 1, name: 'Table 1', type: 'ENGLISH', hourly_rate: 300, minimum_charge: 100 },
   { id: 2, name: 'Table 2', type: 'FRENCH', hourly_rate: 420, minimum_charge: 150 }
 ];
 
+let poolInstance = null;
 let dbInstance = null;
 
-function createTursoAdapter(client) {
+/**
+ * Automates query conversion from SQLite to PostgreSQL
+ */
+function translateQuery(sql) {
+  let translated = sql.trim();
+
+  // 1. Skip SQLite-specific PRAGMA settings
+  if (translated.toUpperCase().startsWith('PRAGMA')) {
+    return 'SELECT 1'; // Return safe no-op
+  }
+
+  // 2. Map transaction commands
+  if (translated.toUpperCase() === 'BEGIN IMMEDIATE') {
+    return 'BEGIN';
+  }
+
+  // 3. Translate SQLite INSERT OR REPLACE into Postgres INSERT ... ON CONFLICT (for settings)
+  if (translated.includes('INSERT OR REPLACE INTO settings')) {
+    translated = translated.replace(
+      /INSERT OR REPLACE INTO settings\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i,
+      (match, cols, vals) => {
+        const colArray = cols.split(',').map(c => c.trim());
+        const updateSet = colArray
+          .filter(c => c !== 'key')
+          .map(c => `${c} = EXCLUDED.${c}`)
+          .join(', ');
+        return `INSERT INTO settings (${cols}) VALUES (${vals}) ON CONFLICT (key) DO UPDATE SET ${updateSet}`;
+      }
+    );
+  }
+
+  // 4. Translate SQLite INSERT OR REPLACE into Postgres INSERT ... ON CONFLICT (for daily_players)
+  if (translated.includes('INSERT OR REPLACE INTO daily_players')) {
+    translated = translated.replace(
+      /INSERT OR REPLACE INTO daily_players\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i,
+      (match, cols, vals) => {
+        const colArray = cols.split(',').map(c => c.trim());
+        const updateSet = colArray
+          .filter(c => c !== 'player_code' && c !== 'date')
+          .map(c => `${c} = EXCLUDED.${c}`)
+          .join(', ');
+        return `INSERT INTO daily_players (${cols}) VALUES (${vals}) ON CONFLICT (player_code, date) DO UPDATE SET ${updateSet}`;
+      }
+    );
+  }
+
+  // 5. Translate schema types ( SQLite AUTOINCREMENT to Postgres SERIAL)
+  translated = translated.replace(/INTEGER PRIMARY KEY AUTOINCREMENT/gi, 'SERIAL PRIMARY KEY');
+  translated = translated.replace(/INTEGER PRIMARY KEY/gi, 'SERIAL PRIMARY KEY');
+
+  // 6. Translate pragma_table_info queries for Postgres information_schema catalog
+  if (translated.includes('pragma_table_info')) {
+    translated = translated.replace(
+      /pragma_table_info\('([^']+)'\)/g,
+      "(SELECT column_name as name FROM information_schema.columns WHERE lower(table_name) = lower('$1')) as pragma_temp_alias"
+    );
+  }
+
+  // 7. Convert SQLite "?" placeholders to Postgres "$1, $2, $3..." style
+  let index = 1;
+  translated = translated.replace(/\?/g, () => `$${index++}`);
+
+  return translated;
+}
+
+/**
+ * Neon Postgres database compatibility layer
+ */
+function createNeonAdapter(pool) {
   return {
     async get(sql, ...params) {
-      const result = await client.execute({ sql, args: params });
+      const translatedSql = translateQuery(sql);
+      const result = await pool.query(translatedSql, params);
       return result.rows[0] ?? undefined;
     },
     async all(sql, ...params) {
-      const result = await client.execute({ sql, args: params });
+      const translatedSql = translateQuery(sql);
+      const result = await pool.query(translatedSql, params);
       return [...result.rows];
     },
     async run(sql, ...params) {
-      const result = await client.execute({ sql, args: params });
+      const translatedSql = translateQuery(sql);
+      const result = await pool.query(translatedSql, params);
       return {
-        lastID: Number(result.lastInsertRowid ?? 0),
-        changes: result.rowsAffected ?? 0
+        lastID: Number(result.rows[0]?.id || 0),
+        changes: result.rowCount ?? 0
       };
     },
     async exec(sql) {
-      await client.executeMultiple(sql);
+      // Split and run multiple statement schema migrations
+      const queries = sql
+        .split(';')
+        .map(q => q.trim())
+        .filter(q => q.length > 0);
+
+      for (const q of queries) {
+        const translatedQ = translateQuery(q);
+        await pool.query(translatedQ);
+      }
     },
     async close() {
-      client.close();
+      await pool.end();
     }
   };
 }
 
 export async function getDB() {
   if (!dbInstance) {
-    if (USE_TURSO) {
-      const { createClient } = await import('@libsql/client');
-      const client = createClient({
-        url: process.env.TURSO_DATABASE_URL,
-        authToken: process.env.TURSO_AUTH_TOKEN
-      });
-      dbInstance = createTursoAdapter(client);
-      console.log('📡 Using Turso database (persistent)');
-    } else {
-      if (process.env.VERCEL) {
-        console.warn('⚠️ Vercel without TURSO_DATABASE_URL — each server instance has its own /tmp DB. Set up Turso for reliable multi-table sessions.');
-      }
-      dbInstance = await open({
-        filename: DB_PATH,
-        driver: sqlite3.Database,
-        mode: sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE
-      });
-      await dbInstance.exec('PRAGMA foreign_keys = ON;');
-      await dbInstance.exec('PRAGMA journal_mode = WAL;');
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error('DATABASE_URL environment variable is missing. Please set this in Vercel to your Neon PostgreSQL connection string.');
     }
+    poolInstance = new Pool({
+      connectionString,
+      ssl: { rejectUnauthorized: false } // Required for secure serverless connections to Neon
+    });
+    dbInstance = createNeonAdapter(poolInstance);
+    console.log('📡 Connected to Neon PostgreSQL (persistent)');
   }
   return dbInstance;
 }
 
 export async function withTransaction(fn) {
   const db = await getDB();
-  await db.run('BEGIN IMMEDIATE');
+  await db.run('BEGIN');
   try {
     const result = await fn(db);
     await db.run('COMMIT');
@@ -99,7 +168,7 @@ export async function migrate() {
     await runAdditionalMigrations(db);
 
     const tableCount = await db.get('SELECT COUNT(*) as count FROM tables');
-    if (tableCount.count === 0) {
+    if (Number(tableCount.count) === 0) {
       console.log('🌱 Seeding Black Racks tables...');
       await seedBlackRacksTables(db);
     } else {
@@ -188,7 +257,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'name'
     `);
 
-    if (nameColumnExists.count === 0) {
+    if (Number(nameColumnExists.count) === 0) {
       console.log('📝 Adding name column to tables...');
       await db.exec('ALTER TABLE tables ADD COLUMN name TEXT');
       console.log('✅ Added name column');
@@ -200,7 +269,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'minimum_charge'
     `);
 
-    if (minimumChargeColumnExists.count === 0) {
+    if (Number(minimumChargeColumnExists.count) === 0) {
       console.log('📝 Adding minimum_charge column to tables...');
       await db.exec('ALTER TABLE tables ADD COLUMN minimum_charge INTEGER NOT NULL DEFAULT 0');
       console.log('✅ Added minimum_charge column');
@@ -213,11 +282,7 @@ async function runAdditionalMigrations(db) {
       { name: 'food_charge', sql: "ALTER TABLE sessions ADD COLUMN food_charge INTEGER NOT NULL DEFAULT 0" },
       { name: 'tip', sql: "ALTER TABLE sessions ADD COLUMN tip INTEGER NOT NULL DEFAULT 0" },
       { name: 'food_items', sql: "ALTER TABLE sessions ADD COLUMN food_items TEXT" },
-      { name: 'payer_name', sql: "ALTER TABLE sessions ADD COLUMN payer_name TEXT" },
-      { name: 'food_charge_p1', sql: "ALTER TABLE sessions ADD COLUMN food_charge_p1 INTEGER NOT NULL DEFAULT 0" },
-      { name: 'food_items_p1', sql: "ALTER TABLE sessions ADD COLUMN food_items_p1 TEXT" },
-      { name: 'food_charge_p2', sql: "ALTER TABLE sessions ADD COLUMN food_charge_p2 INTEGER NOT NULL DEFAULT 0" },
-      { name: 'food_items_p2', sql: "ALTER TABLE sessions ADD COLUMN food_items_p2 TEXT" }
+      { name: 'payer_name', sql: "ALTER TABLE sessions ADD COLUMN payer_name TEXT" }
     ];
 
     for (const column of sessionColumns) {
@@ -226,7 +291,7 @@ async function runAdditionalMigrations(db) {
         FROM pragma_table_info('sessions')
         WHERE name = ?
       `, column.name);
-      if (result.count === 0) {
+      if (Number(result.count) === 0) {
         console.log(`📝 Adding ${column.name} column to sessions...`);
         await db.exec(column.sql);
         console.log(`✅ Added ${column.name} column`);
@@ -239,7 +304,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'loyalty_points'
     `);
 
-    if (loyaltyColumnExists.count === 0) {
+    if (Number(loyaltyColumnExists.count) === 0) {
       console.log('📝 Adding loyalty_points column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN loyalty_points INTEGER DEFAULT 0');
       console.log('✅ Added loyalty_points column');
@@ -251,7 +316,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'membership_expiry_date'
     `);
 
-    if (expiryColumnExists.count === 0) {
+    if (Number(expiryColumnExists.count) === 0) {
       console.log('📝 Adding membership_expiry_date column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN membership_expiry_date INTEGER');
       console.log('✅ Added membership_expiry_date column');
@@ -263,9 +328,9 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'membership_status'
     `);
 
-    if (statusColumnExists.count === 0) {
+    if (Number(statusColumnExists.count) === 0) {
       console.log('📝 Adding membership_status column to customers table...');
-      await db.exec(`ALTER TABLE customers ADD COLUMN membership_status TEXT DEFAULT 'ACTIVE' CHECK (membership_status IN ('ACTIVE','EXPIRED','SUSPENDED'))`);
+      await db.exec(`ALTER TABLE customers ADD COLUMN membership_status TEXT DEFAULT 'ACTIVE'`);
       console.log('✅ Added membership_status column');
     }
 
@@ -275,7 +340,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'date_of_birth'
     `);
 
-    if (dobColumnExists.count === 0) {
+    if (Number(dobColumnExists.count) === 0) {
       console.log('📝 Adding date_of_birth column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN date_of_birth INTEGER');
       console.log('✅ Added date_of_birth column');
@@ -287,7 +352,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'address'
     `);
 
-    if (addressColumnExists.count === 0) {
+    if (Number(addressColumnExists.count) === 0) {
       console.log('📝 Adding address column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN address TEXT');
       console.log('✅ Added address column');
@@ -299,7 +364,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'emergency_contact'
     `);
 
-    if (emergencyColumnExists.count === 0) {
+    if (Number(emergencyColumnExists.count) === 0) {
       console.log('📝 Adding emergency_contact column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN emergency_contact TEXT');
       console.log('✅ Added emergency_contact column');
@@ -311,7 +376,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'id_card_number'
     `);
 
-    if (idCardColumnExists.count === 0) {
+    if (Number(idCardColumnExists.count) === 0) {
       console.log('📝 Adding id_card_number column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN id_card_number TEXT');
       console.log('✅ Added id_card_number column');
@@ -323,7 +388,7 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'photo_url'
     `);
 
-    if (photoColumnExists.count === 0) {
+    if (Number(photoColumnExists.count) === 0) {
       console.log('📝 Adding photo_url column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN photo_url TEXT');
       console.log('✅ Added photo_url column');
@@ -335,14 +400,14 @@ async function runAdditionalMigrations(db) {
       WHERE name = 'membership_start_date'
     `);
 
-    if (membershipStartColumnExists.count === 0) {
+    if (Number(membershipStartColumnExists.count) === 0) {
       console.log('Adding membership_start_date column to customers table...');
       await db.exec('ALTER TABLE customers ADD COLUMN membership_start_date INTEGER');
     }
 
     await db.exec(`
       CREATE TABLE IF NOT EXISTS daily_players (
-        id INTEGER PRIMARY KEY,
+        id SERIAL PRIMARY KEY,
         player_code TEXT NOT NULL,
         name TEXT NOT NULL,
         phone TEXT,
@@ -353,6 +418,7 @@ async function runAdditionalMigrations(db) {
         UNIQUE(player_code, date)
       )
     `);
+    
     await db.exec('CREATE INDEX IF NOT EXISTS idx_daily_players_date ON daily_players(date)');
     await db.exec('CREATE INDEX IF NOT EXISTS idx_daily_players_name ON daily_players(name)');
 
@@ -365,19 +431,5 @@ async function runAdditionalMigrations(db) {
 }
 
 export async function backupDatabase() {
-  if (USE_TURSO) {
-    throw new Error('Database backup is not supported with Turso. Use Turso dashboard backups.');
-  }
-
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const backupPath = path.join(__dirname, `backup-${timestamp}.db`);
-
-  try {
-    fs.copyFileSync(DB_PATH, backupPath);
-    console.log(`✅ Database backed up to: ${backupPath}`);
-    return backupPath;
-  } catch (error) {
-    console.error('❌ Backup failed:', error);
-    throw error;
-  }
+  throw new Error('Database backup is not supported automatically from the app with Neon. Please use the Neon dashboard back-ups.');
 }
